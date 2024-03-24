@@ -94,9 +94,12 @@ class CayleyConv(MessagePassing):
         dia_index = l_row == l_col
         l_weight[dia_index] -= self.alpha
 
-        # Jacobi
-        jacobi, b = self.calculate_jacobi_and_b(l_index, l_weight, dia_index)
+        # hD-iI , (dia(hD+iI))^-1, Off(hD+iI)
+        extended_tmp_right, extended_tmp_off, extended_tmp_Dia = self.calculate_hD(n_nodes, l_index, l_weight, dia_index)
 
+        #calculate jacobi
+        jacobi = -extended_tmp_off * extended_tmp_Dia
+        b = extended_tmp_Dia * extended_tmp_right
 
         # calcualte r polynomials
         for j in range(self.r):
@@ -116,7 +119,7 @@ class CayleyConv(MessagePassing):
         # J Y
         return jacobi.view(-1, 1) * x_j
 
-    def calculate_jacobi_and_b(self,n_nodes, l_index, l_weight, dia_index):
+    def calculate_hD(self, n_nodes, l_index, l_weight, dia_index):
         l_row, l_col = l_index
         #calculate (hD-iI)
         extended_tmp_right = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float)
@@ -137,11 +140,9 @@ class CayleyConv(MessagePassing):
         tmp_off = self.h * l_weight
         tmp_off[dia_index] = 0
         extended_tmp_off[:n_nodes, :n_nodes] = tmp_off
-        
+
         #calculate b
-        
-        b = extended_tmp_Dia * extended_tmp_right
-        
+
         # 计算 (hD + iI)^-1
         #l_dia = l_weight[dia_index]
         #tmp_left = 1 / (self.h * l_dia + self.i)
@@ -158,7 +159,7 @@ class CayleyConv(MessagePassing):
         #b = tmp_left[l_row] * tmp_right_b
         #b = torch.sparse_coo_tensor(indices=l_index, values=b, device=self.i.device)
 
-        return jacobi, b
+        return extended_tmp_right, extended_tmp_off, extended_tmp_Dia
 
     def calculate_b(self, b, y_j):
         return torch.matmul(b, y_j.type(torch.cfloat))
