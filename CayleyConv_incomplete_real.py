@@ -40,6 +40,8 @@ class ComplexLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input):
+        if not input.is_complex():
+            input = torch.complex(input, torch.zeros_like(input))
         return F.linear(input, self.weight, self.bias)
 
 
@@ -65,7 +67,7 @@ class CayleyConv(MessagePassing):
         self.i = Parameter(torch.tensor(0. + 1.j), requires_grad=False)
         self.alpha = Parameter(torch.tensor(0.1, dtype=torch.float))
         #C_0
-        self.real_linear = nn.Linear(in_channels, out_channels, bias=False)
+        self.real_linear = nn.Linear(self.in_channels, out_channels, bias=False)
         #C_1...C_r
         self.complex_linears = nn.ModuleList([ComplexLinear(in_channels, out_channels, bias=False) for _ in range(r)])
         self.reset_parameters()
@@ -82,7 +84,9 @@ class CayleyConv(MessagePassing):
             edge_index: Tensor,
     ) -> Tensor:
 
-        y_j = x
+        y_1 = x
+        zeros = torch.zeros_like(y_1)
+        y_j = torch.cat([y_1, zeros], dim=0)
         out = self.real_linear(y_j)
 
         n_nodes = x.size(self.node_dim)
@@ -95,11 +99,11 @@ class CayleyConv(MessagePassing):
         l_weight[dia_index] -= self.alpha
 
         # hD-iI , (dia(hD+iI))^-1, Off(hD+iI)
-        extended_tmp_right, extended_tmp_off, extended_tmp_Dia = self.calculate_hD(n_nodes, l_index, l_weight, dia_index)
+        extended_tmp_right, extended_tmp_off, extended_tmp_Dia = self.calculate_hD(n_nodes, l_index, l_weight, dia_index,device)
 
         #calculate jacobi
-        jacobi = -extended_tmp_off * extended_tmp_Dia
-        b = extended_tmp_Dia * extended_tmp_right
+        jacobi = -extended_tmp_off @ extended_tmp_Dia
+        b = extended_tmp_Dia @ extended_tmp_right
 
         # calcualte r polynomials
         for j in range(self.r):
@@ -110,59 +114,43 @@ class CayleyConv(MessagePassing):
             # K jacobi iteration
             for k in range(self.K):
                 # y_j ^ k+1 = J @ y_j ^ k + b_j
-                y_j_k = self.propagate(l_index, x=y_j_k, jacobi=jacobi) + b_j
+                y_j_k = jacobi @ y_j_k + b_j
             y_j = y_j_k
             out = out + 2 * (self.complex_linears[j](y_j)).real
         return out
 
-    def message(self, x_j: Tensor, jacobi: Tensor) -> Tensor:
-        # J Y
-        return jacobi.view(-1, 1) * x_j
 
-    def calculate_hD(self, n_nodes, l_index, l_weight, dia_index):
+    def calculate_hD(self, n_nodes, l_index, l_weight, dia_index, device):
         l_row, l_col = l_index
         #calculate (hD-iI)
-        extended_tmp_right = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float)
-        tmp_right_b = (l_weight * self.h)
+        extended_tmp_right = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float, device=device)
+        L = torch.zeros(n_nodes, n_nodes, dtype=torch.float, device=device)
+        row, col = l_index
+        L[row, col] = l_weight
+        tmp_right_b = (L * self.h)
         extended_tmp_right[:n_nodes, :n_nodes] = tmp_right_b
-        I = torch.eye(n_nodes)
+        I = torch.eye(n_nodes, dtype = torch.float, device=device)
         extended_tmp_right[n_nodes:, n_nodes:] = -I
 
         #calculate (Dia(hD+iI))^-1
-        extended_tmp_Dia = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float)
-        l_dia = l_weight[dia_index]
-        tmp_left = 1/(self.h*l_dia)
+        extended_tmp_Dia = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float, device=device)
+        D = torch.zeros(n_nodes, dtype=torch.float, device=device)
+        D = l_weight[dia_index] * self.h
+        tmp_left = 1 / D
         extended_tmp_Dia[:n_nodes, :n_nodes] = torch.diag(tmp_left)
-        extended_tmp_Dia[n_nodes:, n_nodes:] = torch.diag(I)
+        extended_tmp_Dia[n_nodes:, n_nodes:] = I
 
         #calculate (Off(hD+iI))
-        extended_tmp_off = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float)
-        tmp_off = self.h * l_weight
-        tmp_off[dia_index] = 0
-        extended_tmp_off[:n_nodes, :n_nodes] = tmp_off
+        extended_tmp_off = torch.zeros(2*n_nodes, 2*n_nodes, dtype=torch.float, device=device)
+        Off = L.clone()
+        Off.fill_diagonal_(0)
+        extended_tmp_off[:n_nodes, :n_nodes] = Off
 
-        #calculate b
-
-        # 计算 (hD + iI)^-1
-        #l_dia = l_weight[dia_index]
-        #tmp_left = 1 / (self.h * l_dia + self.i)
-        #tmp_left.masked_fill_(tmp_left == float('inf'), 0. + 0.j)
-
-        # 计算 Jacobi 矩阵
-        #tmp_right_jacobi = self.h * l_weight.type(torch.cfloat)
-        #tmp_right_jacobi[dia_index] = 0. + 0.j
-        #jacobi = -tmp_left[l_row] * tmp_right_jacobi
-
-        # 计算 b
-        #tmp_right_b = (l_weight * self.h).type(self.i.dtype)
-        #tmp_right_b[dia_index] += self.i
-        #b = tmp_left[l_row] * tmp_right_b
-        #b = torch.sparse_coo_tensor(indices=l_index, values=b, device=self.i.device)
 
         return extended_tmp_right, extended_tmp_off, extended_tmp_Dia
 
     def calculate_b(self, b, y_j):
-        return torch.matmul(b, y_j.type(torch.cfloat))
+        return torch.matmul(b, y_j.type(torch.float))
 
 
 class CayleyNet(nn.Module):
@@ -225,7 +213,6 @@ for epoch in range(10):
     losses = []
     epoch_time = time.time() - epoch_start_time
     time_stamps['epoch_time'].append(epoch_time)
-    print(f"Epoch {epoch+1} Loss: {epoch_loss}")
     print(f"Epoch {epoch+1} Total Time: {epoch_time:.2f} seconds")
 
 
