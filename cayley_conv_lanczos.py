@@ -212,7 +212,7 @@ class CayleyConvLanczos(nn.Module):
     
 
     def get_eigen_cayley_filter(self, eig_vals):
-        return  (self.h * (eig_vals - self.alpha) - self.i) / (self.h * (eig_vals - self.alpha) + self.i)
+        return  (self.h * eig_vals - self.alpha * self.i) / (self.h * eig_vals - self.alpha * self.i)
 
     def eigen_decomposition(self, lap_index, lap_weight, n_nodes, k):
         sparse_lap = coo_matrix((lap_weight, lap_index), shape=(n_nodes, n_nodes))
