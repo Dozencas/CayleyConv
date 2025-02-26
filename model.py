@@ -1,29 +1,14 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import time
-import numpy as np
+
 from torch import Tensor
 from torch.nn import Parameter
-from scipy.sparse.linalg import eigsh
-from scipy.sparse import coo_matrix
+from torch_geometric.nn import TopKPooling, global_mean_pool, MessagePassing
+from torch_geometric.utils import get_laplacian
 
-from torch_geometric.nn import MessagePassing, TopKPooling, global_mean_pool, ChebConv
-from torch_geometric.utils import degree, get_laplacian
-from tqdm import trange
-from torch_geometric.datasets import TUDataset
-from torch_geometric.loader import DataLoader
-from torch_sparse import SparseTensor
-
-time_stamps = {
-    'data_loading': [],
-    'forward_pass': [],
-    'loss_calculation': [],
-    'backward_pass': [],
-    'optimization': [],
-    'epoch_time': []
-}
 
 class ComplexLinear(nn.Module):
     def __init__(self, in_features, out_features, bias=True):
@@ -82,9 +67,9 @@ class CayleyConv(MessagePassing):
     def forward(
             self,
             x: Tensor,
-            edge_index: Tensor,
+            data
     ) -> Tensor:
-
+        edge_index = data.edge_index
         y_j = x
         out = self.real_linear(y_j)
 
@@ -145,162 +130,76 @@ class CayleyConv(MessagePassing):
 
 
 
-class CayleyConvLanczos(nn.Module):
-    def __init__(
-            self,
-            r: int,
-            in_channels: int,
-            out_channels: int,
-            eig_ratio: float = 0.5,
-            **kwargs,
-    ):
-        super().__init__(**kwargs)
 
-        assert r > 0
+class CayleyConvLanczos(nn.Module):
+    def __init__(self, r, in_channels, out_channels, **kwargs):
+        super().__init__(**kwargs)
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.r = r
-        self.eig_ratio = eig_ratio
         self.h = Parameter(torch.tensor(0.5, dtype=torch.float))
         self.i = Parameter(torch.tensor(0. + 1.j), requires_grad=False)
         self.alpha = Parameter(torch.tensor(0.1, dtype=torch.float))
-        #C_0
         self.c_0 = Parameter(torch.randn((out_channels, in_channels)))
-        #C_1...C_r
         self.c_j = Parameter(torch.randn((r, out_channels, in_channels), dtype=torch.cfloat))
 
-
-    def forward(
-            self,
-            x: Tensor,
-            edge_index: Tensor,
-    ) -> Tensor:
-
-        n_nodes = x.size(0)  # m
-        k = max(int(n_nodes * self.eig_ratio), 6) # number of eigen vals in lanczos method
-
-        device = edge_index.device
-        edge_weight = torch.ones(edge_index.size(1), device=device)
-        # Laplacian
-        l_index, l_weight = get_laplacian(edge_index, edge_weight, normalization=None, num_nodes=n_nodes)
-        eig_vals, eig_vecs = self.eigen_decomposition(l_index, l_weight, n_nodes, k)
-        res = torch.zeros((x.shape[0], self.out_channels), dtype=torch.float)  # (m * d_out)
-        for i in range(k):
-            eigen_filter = self.get_eigen_cayley_filter(eig_vals[i]) # d_out * d_in
+    def forward(self, x, data):
+        eig_vals = data.eig_vals
+        eig_vecs = data.eig_vecs
+        res = torch.zeros((x.shape[0], self.out_channels), dtype=torch.float, device=self.i.device)
+        for i in range(len(eig_vals)):
+            eigen_filter = self.get_eigen_cayley_filter(eig_vals[i])
             v_i = eig_vecs[:, i].reshape(-1, 1)
-            vi_t_x = v_i.T @ x # 1 * d_in
-            vi_t_x_Q = vi_t_x @ eigen_filter.T # 1 * d_out
+            vi_t_x = v_i.T @ x
+            vi_t_x_Q = vi_t_x @ eigen_filter.T
             res += v_i @ vi_t_x_Q
-
         return res
-    
 
     def get_eigen_cayley_filter(self, eig_val):
-        """
-            return shape: d_out * d_in
-        """
         base = (self.h * (eig_val - self.alpha) - self.i) / (self.h * (eig_val - self.alpha) + self.i)
-        r_complex = torch.stack([self.c_j[j-1] * base ** j for j in range(1, 1 + self.r)]).sum(0) # (r, )
-        return  self.c_0 + 2 * r_complex.real
-
-    def eigen_decomposition(self, lap_index, lap_weight, n_nodes, k):
-        sparse_lap = coo_matrix((lap_weight, lap_index), shape=(n_nodes, n_nodes))
-        vals, vecs = eigsh(sparse_lap, k=k, which='SM')
-        return torch.from_numpy(vals).to(self.i.device), torch.from_numpy(vecs).to(self.i.device)
-
-
-
+        r_complex = torch.stack([self.c_j[j-1] * base ** j for j in range(1, 1 + self.r)]).sum(0)
+        return self.c_0 + 2 * r_complex.real
 
 
 class CayleyNet(nn.Module):
-    def __init__(self, n_conv, r, K, feature_dim, hidden_dim, output_dim):
+    def __init__(self, n_conv, r, feature_dim, hidden_dim, output_dim, conv_type="lanczos"):
+        """_summary_
+
+        Args:
+            n_conv (_type_): conv layer number
+            r (_type_): factor of the cayley filter
+            feature_dim (_type_): feature dimension
+            hidden_dim (_type_): hidden dimension
+            output_dim (_type_): output dimension
+            conv_type (str, optional): conv backbone type, "lanczos" or "jacobi", defaults to "lanczos".
+        """
         super(CayleyNet, self).__init__()
         convs = []
+        if(conv_type == "lanczos"):
+            print("Using Lanczos Cayley Convolution")
+        else:
+            print("Using Jacobi Cayley Convolution")
         for i in range(n_conv):
-            # convs.append(CayleyConv(r, K, feature_dim if i == 0 else hidden_dim, hidden_dim))
-            convs.append(CayleyConvLanczos(r, feature_dim if i == 0 else hidden_dim, hidden_dim))
+            conv = CayleyConvLanczos(r, feature_dim if i == 0 else hidden_dim, hidden_dim) if conv_type == "lanczos" else CayleyConv(r, 5, feature_dim if i == 0 else hidden_dim, hidden_dim)
+            convs.append(conv)
             convs.append(nn.ReLU())
         self.convs = nn.ModuleList(convs)
-        # self.caley_conv = CayleyConv(r, K, feature_dim, hidden_dim)
+        self.conv_type = conv_type
         self.pool = TopKPooling(hidden_dim, ratio=0.9)
         self.lin = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x, edge_index, batch):
+    def forward(self, data):
+        x = data.x
         for i in range(0, len(self.convs), 2):
             conv = self.convs[i]
             relu = self.convs[i + 1]
-            x = conv(x, edge_index)
+            x = conv(x, data)
             x = relu(x)
 
-        x, edge_index, _, batch, _, _ = self.pool(x, edge_index, batch=batch)
-
-        x = global_mean_pool(x, batch=batch)
-
+        # x, edge_index, _, batch, _, _ = self.pool(x, edge_index, batch=batch)
+        # x = global_mean_pool(x, batch=batch)
+        x = torch.mean(x, dim=0).reshape(1, -1)
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.lin(x)
-
         return x
 
-
-
-def train(model, train_loader, optimizer, loss_func):
-    model.train()
-    h_list = []
-    alpha_list = []
-    loss_list = []
-    for epoch in range(10):
-        epoch_start_time = time.time()
-        losses = []
-        for data in train_loader:
-            data = data.to(DEVICE)
-            out = model(data.x, data.edge_index, data.batch)
-            loss = loss_func(out, data.y)
-            loss.backward()
-            losses.append(loss.cpu().item())
-            optimizer.step()
-            optimizer.zero_grad()
-        h_list.append([l.h.data.cpu().item() for i, l in enumerate(model.convs) if i % 2 == 0])
-        alpha_list.append([l.alpha.data.cpu().item() for i, l in enumerate(model.convs) if i % 2 == 0])
-        epoch_loss = np.mean(losses)
-        loss_list.append(epoch_loss)
-        losses = []
-        epoch_time = time.time() - epoch_start_time
-        time_stamps['epoch_time'].append(epoch_time)
-        print(f"Epoch {epoch+1} Loss: {epoch_loss}; Total Time: {epoch_time:.2f} seconds")
-
-
-def evaluate(model, test_loader):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for data in test_loader:
-            data = data.to(DEVICE)
-            out = model(data.x, data.edge_index, data.batch)
-            pred = out.argmax(dim=1)
-            correct += int((pred == data.y).sum())
-            total += len(pred)
-    print("{} test accuracy".format(correct / total))
-
-
-
-def main():
-    dataset = TUDataset(root='data/TUDataset', name='MUTAG')
-    N_CONV = 3
-    model = CayleyNet(n_conv=N_CONV, r=3, K=3, feature_dim=dataset.num_features, hidden_dim=64, output_dim=dataset.num_classes).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    criterion = torch.nn.CrossEntropyLoss()
-    train_dataset = dataset[:350]
-    test_dataset = dataset[350:]
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=16)
-
-    train(model, train_loader=train_loader, optimizer=optimizer, loss_func=criterion)
-    evaluate(model, test_loader=test_loader)
-
-#DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-DEVICE = 'cpu'
-
-if __name__ == '__main__':
-    main()
